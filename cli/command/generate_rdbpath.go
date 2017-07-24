@@ -1,6 +1,7 @@
 package command
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -18,24 +19,49 @@ import (
 
 var GenerateRdbPathCommand = cli.Command{
 	Name:   "genrdb",
-	Usage:  "genrdb -r [bj/nj/gz] -s",
+	Usage:  "genrdb -r=[bj/nj/gz] -c=[master/oneslave/allslave/all] -i=[60] -s=[ture/false] ",
 	Action: genRdbAction,
 	Flags: []cli.Flag{
 		cli.StringFlag{"r,region", "", "region to gernate rdb"},
-		cli.BoolFlag{"s,save", "send bgsave command"},
+		cli.StringFlag{"c,dump candidates", "oneslave", "master/oneslave/allslave/all"},
+		cli.BoolFlag{"s,save", "really send bgsave command"},
+		cli.IntFlag{"i,interval", 60, "send bgsave to instance interval"},
 	},
 	Description: `
 	generate rdb files for each replica set
 	`,
 }
 
+func BgSaveRedis(node *topo.Node, really_save bool, interval int) error {
+	if really_save {
+		response, err := redis.RedisCli(node.Addr(), "BGSAVE")
+		res := response.(string)
+		if err != nil || res != "Background saving started" {
+			err_info := fmt.Sprintf("bgsave node:%s fail:%s, response:%s\n", node.Addr(), err.Error(), res)
+			return errors.New(err_info)
+		}
+		time.Sleep(time.Duration(interval) * time.Second)
+	}
+
+	unitId := strings.Split(node.Tag, ".")[1]
+	fmt.Printf("save node:%s(%s,%s) to ftp://%s/home/matrix/containers/%s.redis3db-%s.osp.%s/home/work/data/dump.rdb\n",
+		node.Id, node.Role, node.Addr(), node.Ip, unitId, context.GetAppName(), node.Zone)
+	return nil
+}
+
 func genRdbAction(c *cli.Context) {
 	region := c.String("r")
-	if region == "" {
-		fmt.Println("region should be assigned")
+
+	candidates := c.String("c")
+
+	if candidates != "master" && candidates != "oneslave" && candidates != "allslave" && candidates != "all" {
+		fmt.Printf("invalid candidates\n")
 		return
 	}
-	save := c.Bool("s")
+
+	interval := c.Int("i")
+
+	really_save := c.Bool("s")
 
 	addr := context.GetLeaderAddr()
 	url := "http://" + addr + api.FetchReplicaSetsPath
@@ -56,19 +82,31 @@ func genRdbAction(c *cli.Context) {
 	sort.Sort(topo.ByNodeState(rss.ReplicaSets))
 
 	for _, rs := range rss.ReplicaSets {
-		//slaves
-		for _, n := range rs.Slaves {
-			if n.Region == region {
-				if save {
-					//send bgsave command first, ignore result
-					redis.RedisCli(n.Addr(), "BGSAVE")
+		// process master
+		if candidates == "all" || candidates == "master" {
+			err = BgSaveRedis(rs.Master, really_save, interval)
+			if err != nil {
+				fmt.Println(err)
+				return
+			}
+		}
+		// process slaves
+		if candidates != "master" {
+			for _, n := range rs.Slaves {
+				if region == "" || region == n.Region {
+					err = BgSaveRedis(n, really_save, interval)
+					if err != nil {
+						fmt.Println(err)
+						return
+					}
+					if candidates == "oneslave" {
+						break
+					}
 				}
-				unitId := strings.Split(n.Tag, ".")[1]
-				rdbPath := fmt.Sprintf("ftp://%s/home/matrix/containers/%s.redis3db-%s.osp.%s/home/work/data/dump.rdb",
-					n.Ip, unitId, context.GetAppName(), n.Zone)
-				fmt.Println(rdbPath)
-				break
 			}
 		}
 	}
+
+	fmt.Println("ok, all finished!\n")
+	return
 }
